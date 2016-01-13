@@ -2,7 +2,7 @@
 
 *SSLsplit* allows you to set up static forward addresses/ports, to forward connections to different destinations. When you set your HTTP(S) proxy as a forward destination, and enable pass through mode, *SSLsplit* essentially functions as a transparent HTTP(S) proxy, albeit only for HTTP and without support for proxy authentication. For HTTPS, it is necessary to first send a `CONNECT` message to the HTTP(S) proxy, and then discard the reply. 
 
-The modifications to *SSLsplit* in branch `transparent` of this fork, fill the gap and turn *SSLsplit* into a fully transparent proxy for HTTP and HTTPS. It finally puts an end to all the headaches we've had with our company HTTP(S) proxy...
+The modifications to *SSLsplit* in branch `transparent` of this fork, fill the gap and turn *SSLsplit* into a fully transparent proxy for HTTP and HTTPS. I like to call it *The Interceptor* ;-) It finally puts an end to all the headaches we've had with our company HTTP(S) proxy...
 
 ## Usage
 
