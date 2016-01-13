@@ -1,3 +1,77 @@
+# Purpose of this Fork
+
+*SSLsplit* allows you to set up static forward addresses/ports, to forward connections to different destinations. When you set your HTTP(S) proxy as a forward destination, and enable pass through mode, *SSLsplit* essentially functions as a transparent HTTP(S) proxy, albeit only for HTTP and without support for proxy authentication. For HTTPS, it is necessary to first send a `CONNECT` message to the HTTP(S) proxy, and then discard the reply. 
+
+The modifications to *SSLsplit* in branch `transparent` of this fork, fill the gap and turn *SSLsplit* into a fully transparent proxy for HTTP and HTTPS. It finally puts an end to all the headaches we've had with our company HTTP(S) proxy...
+
+## Usage
+
+### Running *SSLsplit*
+
+To run *SSLsplit* as a transparent HTTP(S) proxy, you would do for example:
+
+```bash
+sslsplit -D -P -t ./certdir/ https 0.0.0.0 8443 {HTTPS proxy} {HTTPS proxy port} http 0.0.0.0 8080 {HTTP proxy} {HTTP proxy port}
+```
+
+This instructs *SSLsplit* to accept HTTPS connections on port `8443` and HTTP connections on port `8080` (change as needed), and forward them to your HTTP(S) proxy. Replace `{HTTP(S) proxy}` and `{HTTP(S) port}` with your HTTP(S) proxy. The `-P -t ./certdir/` (with `certdir` being empty) enables unconditional HTTPS pass through. 
+
+### IP Forwarding & Rerouting for `*:80` and `*:443`
+
+What's missing now is a few IP tables rules that reroute your HTTP(S) traffic to *SSLsplit*. How you do that depends on your desired setup. You can run *SSLsplit* on your workstation and have it act as a purely local transparent proxy. Or you set up a dedicated machine with *SSLsplit* running and use that as the default gateway for any machine that needs transparent proxying. That's the setup we have been using quite extensively for almost a year now, and it works great for things such as `devstack`, `git` (over HTTPS), `apt-get`, `yum`, anything really.
+
+For this centralized setup, we need to enable IP forwarding on the server so that it can act as a gateway:
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+```
+
+Then we need a few IP tables rules to reroute all traffic destined for ports `80` and `443` to `8080` and `8443` (or whatever you chose when starting *SSLsplit*) on the server instead, where *SSLsplit* is listening. A shell script to do this could look like this:
+
+```bash
+#!/bin/bash
+
+# see: http://bramp.net/blog/2010/01/26/redirect-local-traffic-to-a-web-cache-with-iptables/
+
+# Don't touch local traffic (localhost and internal network)
+sudo iptables -t nat -A OUTPUT -o lo -j RETURN
+sudo iptables -t nat -A OUTPUT --dst 127.0.0.1/8 -j RETURN
+sudo iptables -t nat -A OUTPUT --dst 10.0.0.0/8 -j RETURN
+# Add any other local networks here.
+
+# reroute outgoing traffic
+sudo iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 8080
+sudo iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 8443
+
+# reroute forwarded traffic
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to 8080
+sudo iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to 8443
+```
+
+Starting *SSLsplit*, enabling IP forwarding and setting up the IP tables rules should be made persistent, of course. For starting *SSLsplit* and keeping it running, we use `supervisord`. There are occasional `SIGSEGV`s, and the restart of *SSLsplit* through `supervisord` is usually tolerated by the clients and causes no problems. 
+
+### Authenticating Proxies
+
+This also works with authenticating HTTP proxies, however currently only *Basic* authentication is supported (i.e. no support for *Digest* and *NTLM*). Start *SSLsplit* with the additional `-w user:password` option, to have it talk to an authenticating proxy. It will then forward all intercepted traffic to the HTTP(S) proxy with the provided credentials. Note that when using a centralized setup in this way, consequently all traffic handled by it will appear to be coming from the same user. Where this is not acceptable, a local setup per user is needed.  
+
+### Remove Proxy Settings
+
+You can use the *SSLsplit*-based transparent proxy in combination with explicit proxy settings. You may want to keep using explicit proxy configuration for your browser, e.g. if you already have an elaborate proxy `pac` file or automatic proxy detection. 
+
+For sanity & peace of mind, I still think it's probably best to get rid of all proxy settings on your machine. In *Ubuntu*, type `proxy` in the dash, which suggests the network settings. Open that, and set *Network proxy* to *None*, then *Apply system wide*. If you've configured the proxy yourself anywhere, e.g. in `/etc/apt/apt.conf` for `apt-get`, remove those settings. Also check your environment settings, i.e.
+
+```bash
+env | grep -i proxy
+```
+
+should not report any proxy settings.
+
+Happy Proxy-free Hacking!
+
+---
+
+Below this point, the original README...
+
 # SSLsplit - transparent and scalable SSL/TLS interception [![Build Status](https://travis-ci.org/droe/sslsplit.svg?branch=master)](https://travis-ci.org/droe/sslsplit)
 Copyright (C) 2009-2014, [Daniel Roethlisberger](//daniel.roe.ch/).  
 http://www.roe.ch/SSLsplit
