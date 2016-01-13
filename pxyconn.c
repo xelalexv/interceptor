@@ -167,6 +167,10 @@ typedef struct pxy_conn_ctx {
 	socklen_t addrlen;
 	int af;
 	X509 *origcrt;
+	
+	/* truly original destination address when in static forward */
+	struct sockaddr_storage org_addr;
+	socklen_t org_addrlen;
 
 	/* references to event base and configuration */
 	struct event_base *evbase;
@@ -363,7 +367,7 @@ pxy_log_connect_nonhttp(pxy_conn_ctx_t *ctx)
 		              " %s"
 #endif /* HAVE_LOCAL_PROCINFO */
 		              "\n",
-		              ctx->passthrough ? "passthrough" : "tcp",
+		              ctx->passthrough ? "Passthrough" : "TCP",
 		              STRORDASH(ctx->src_str),
 		              STRORDASH(ctx->dst_str)
 #ifdef HAVE_LOCAL_PROCINFO
@@ -534,7 +538,7 @@ pxy_ossl_sessnew_cb(MAYBE_UNUSED SSL *ssl, SSL_SESSION *sess)
 	if (sess) {
 		log_dbg_print_free(ssl_session_to_str(sess));
 	} else {
-		log_dbg_print("(null)\n");
+		log_dbg_printf("(null)\n");
 	}
 #endif /* DEBUG_SESSION_CACHE */
 #ifdef WITH_SSLV2
@@ -565,7 +569,7 @@ pxy_ossl_sessremove_cb(UNUSED SSL_CTX *sslctx, SSL_SESSION *sess)
 	if (sess) {
 		log_dbg_print_free(ssl_session_to_str(sess));
 	} else {
-		log_dbg_print("(null)\n");
+		log_dbg_printf("(null)\n");
 	}
 #endif /* DEBUG_SESSION_CACHE */
 	if (sess) {
@@ -965,6 +969,7 @@ pxy_dstssl_create(pxy_conn_ctx_t *ctx)
 
 	sslctx = SSL_CTX_new(ctx->opts->sslmethod());
 	if (!sslctx) {
+		ERR_print_errors_fp(stderr); 
 		ctx->enomem = 1;
 		return NULL;
 	}
@@ -1141,6 +1146,7 @@ pxy_bufferevent_setup(pxy_conn_ctx_t *ctx, evutil_socket_t fd, SSL *ssl)
 static char *
 pxy_http_reqhdr_filter_line(const char *line, pxy_conn_ctx_t *ctx)
 {
+	
 	/* parse information for connect log */
 	if (!ctx->http_method) {
 		/* first line */
@@ -1166,6 +1172,46 @@ pxy_http_reqhdr_filter_line(const char *line, pxy_conn_ctx_t *ctx)
 				ctx->seen_req_header = 1;
 				space2 = space1 + strlen(space1);
 			}
+			
+			// rewrite GET for proxy
+			char *newhdr = NULL;
+			if (!strncasecmp(line, "GET ", 4)) {
+#ifdef DEBUG_PROXY
+				log_dbg_printf("Rewriting GET:\n\tfrom: %s\n", line);
+#endif
+				char dest_addr[INET6_ADDRSTRLEN];
+				char dest_serv[8];
+				int err = getnameinfo((struct sockaddr*)&ctx->org_addr, 
+					ctx->org_addrlen, 
+					dest_addr, sizeof(dest_addr), 
+					dest_serv, sizeof(dest_serv), 
+					NI_NUMERICHOST | NI_NUMERICSERV);
+				if (err != 0) {
+					log_err_printf("\nGET rewrite: failed to convert "
+						"address to string (code=%d)\n", err);
+				} else {
+					int rv = asprintf(&newhdr, "GET http://%s:%s%s", 
+						dest_addr, dest_serv, space1);
+					if ((rv < 0) || !newhdr) {
+						ctx->enomem = 1;
+					} else {
+#ifdef DEBUG_PROXY
+						log_dbg_printf("\t  to: %s\n", newhdr);
+#endif
+						// add proxy authorization; just empty string if not set
+						// seems to be working best when it comes right after GET line
+						if (ctx->opts->proxyAuth && 
+							(strlen(ctx->opts->proxyAuth) > 0)) {
+							log_dbg_printf(
+								"Adding proxy authorization for HTTP\n");
+							char *hdr = newhdr;
+							asprintf(&newhdr, "%s\r\n%s", hdr, ctx->opts->proxyAuth);
+							free(hdr);
+						}
+					}
+				}				
+			}			
+			
 			ctx->http_uri = malloc(space2 - space1 + 1);
 			if (ctx->http_uri) {
 				memcpy(ctx->http_uri, space1, space2 - space1);
@@ -1174,7 +1220,12 @@ pxy_http_reqhdr_filter_line(const char *line, pxy_conn_ctx_t *ctx)
 				ctx->enomem = 1;
 				return NULL;
 			}
+			
+			if (newhdr) {
+				return newhdr;
+			}
 		}
+
 	} else {
 		/* not first line */
 		char *newhdr;
@@ -1202,7 +1253,12 @@ pxy_http_reqhdr_filter_line(const char *line, pxy_conn_ctx_t *ctx)
 		           !strncasecmp(line, "Keep-Alive:", 11)) {
 			return NULL;
 		} else if (line[0] == '\0') {
-			ctx->seen_req_header = 1;
+			ctx->seen_req_header = !ctx->spec->http;
+#ifdef DEBUG_PROXY
+			if (ctx->seen_req_header) {
+				log_dbg_printf("No need for request header munging\n");
+			}
+#endif
 			if (!ctx->sent_http_conn_close) {
 				newhdr = strdup("Connection: close\r\n");
 				if (!newhdr) {
@@ -1285,6 +1341,9 @@ pxy_http_resphdr_filter_line(const char *line, pxy_conn_ctx_t *ctx)
 		    !strncasecmp(line, "Alternate-Protocol:", 19)) {
 			return NULL;
 		} else if (line[0] == '\0') {
+#ifdef DEBUG_PROXY
+			log_dbg_printf("No need for response header munging\n");
+#endif
 			ctx->seen_resp_header = 1;
 		}
 	}
@@ -1465,100 +1524,159 @@ pxy_bev_readcb(struct bufferevent *bev, void *arg)
 	struct evbuffer *outbuf = bufferevent_get_output(other->bev);
 
 	/* request header munging */
-	if (ctx->spec->http && !ctx->seen_req_header && (bev == ctx->src.bev)
-	    && !ctx->passthrough) {
-		logbuf_t *lb = NULL, *tail = NULL;
-		char *line;
-		while ((line = evbuffer_readln(inbuf, NULL,
-		                               EVBUFFER_EOL_CRLF))) {
-			char *replace;
-			if (WANT_CONTENT_LOG(ctx)) {
-				logbuf_t *tmp;
-				tmp = logbuf_new_printf(NULL, NULL,
-				                        "%s\r\n", line);
-				if (tail) {
-					if (tmp) {
-						tail->next = tmp;
-						tail = tail->next;
-					}
-				} else {
-					lb = tail = tmp;
-				}
+	if (ctx->spec->http && !ctx->seen_req_header && (bev == ctx->src.bev)) {
+	    
+	    /* 
+	     * When in passthrough mode and an upstream proxy is set, first 
+	     * send the CONNECT message before starting to actually pass 
+	     * through the traffic.
+	     */
+	    if (ctx->passthrough) {
+			
+#ifdef DEBUG_PROXY
+			log_dbg_printf("Request header munging for HTTPS\n");
+#endif
+			char dest_addr[INET6_ADDRSTRLEN];
+			char dest_serv[8];
+			int err = getnameinfo((struct sockaddr*)&ctx->org_addr, 
+				ctx->org_addrlen, 
+				dest_addr, sizeof(dest_addr), 
+				dest_serv, sizeof(dest_serv), 
+				NI_NUMERICHOST | NI_NUMERICSERV);
+			if (err != 0) {
+				log_err_printf("\nUpstream proxy: failed to convert "
+					"address to string (code=%d)\n", err);
+			} else {
+				log_dbg_printf("\nRequest to upstream proxy:\n\tCONNECT "
+					"%s:%s HTTP/1.1\n\t%s\n", dest_addr, dest_serv,
+					(strlen(ctx->opts->proxyAuth) > 0 ? "<proxy authorization>" : ""));
+				evbuffer_add_printf(outbuf, "CONNECT %s:%s HTTP/1.1\r\n%s%s\r\n", 
+					dest_addr, dest_serv, ctx->opts->proxyAuth, 
+					(strlen(ctx->opts->proxyAuth) > 0 ? "\r\n" : ""));
 			}
-			replace = pxy_http_reqhdr_filter_line(line, ctx);
-			if (replace == line) {
-				evbuffer_add_printf(outbuf, "%s\r\n", line);
-			} else if (replace) {
-				evbuffer_add_printf(outbuf, "%s\r\n", replace);
-				free(replace);
-			}
-			free(line);
-			if (ctx->seen_req_header) {
-				/* request header complete */
-				if (ctx->opts->deny_ocsp) {
-					pxy_ocsp_deny(ctx);
-				}
-				break;
-			}
-		}
-		if (lb && WANT_CONTENT_LOG(ctx)) {
-			if (log_content_submit(ctx->logctx, lb,
-			                       1/*req*/) == -1) {
-				logbuf_free(lb);
-				log_err_printf("Warning: Content log "
-				               "submission failed\n");
-			}
-		}
-		if (!ctx->seen_req_header)
+
+			ctx->seen_req_header = 1;
 			return;
+						
+		} else {
+
+#ifdef DEBUG_PROXY
+			log_dbg_printf("Request header munging for HTTP\n");
+#endif
+			logbuf_t *lb = NULL, *tail = NULL;
+			char *line;
+			while ((line = evbuffer_readln(inbuf, NULL,
+										   EVBUFFER_EOL_CRLF))) {
+				char *replace;
+				if (WANT_CONTENT_LOG(ctx)) {
+					logbuf_t *tmp;
+					tmp = logbuf_new_printf(NULL, NULL,
+											"%s\r\n", line);
+					if (tail) {
+						if (tmp) {
+							tail->next = tmp;
+							tail = tail->next;
+						}
+					} else {
+						lb = tail = tmp;
+					}
+				}
+				replace = pxy_http_reqhdr_filter_line(line, ctx);
+				if (replace == line) {
+					evbuffer_add_printf(outbuf, "%s\r\n", line);
+				} else if (replace) {
+					evbuffer_add_printf(outbuf, "%s\r\n", replace);
+					free(replace);
+				}
+				free(line);
+				if (ctx->seen_req_header) {
+					/* request header complete */
+					if (ctx->opts->deny_ocsp) {
+						pxy_ocsp_deny(ctx);
+					}
+					break;
+				}
+			}
+			
+			if (lb && WANT_CONTENT_LOG(ctx)) {
+				if (log_content_submit(ctx->logctx, lb,
+									   1/*req*/) == -1) {
+					logbuf_free(lb);
+					log_err_printf("Warning: Content log "
+								   "submission failed\n");
+				}
+			}
+			if (!ctx->seen_req_header)
+				return;
+		}
 	} else
 	/* response header munging */
-	if (ctx->spec->http && !ctx->seen_resp_header && (bev == ctx->dst.bev)
-	    && !ctx->passthrough) {
-		logbuf_t *lb = NULL, *tail = NULL;
-		char *line;
-		while ((line = evbuffer_readln(inbuf, NULL,
-		                               EVBUFFER_EOL_CRLF))) {
-			char *replace;
-			if (WANT_CONTENT_LOG(ctx)) {
-				logbuf_t *tmp;
-				tmp = logbuf_new_printf(NULL, NULL,
-				                        "%s\r\n", line);
-				if (tail) {
-					if (tmp) {
-						tail->next = tmp;
-						tail = tail->next;
-					}
-				} else {
-					lb = tail = tmp;
-				}
+	if (ctx->spec->http && !ctx->seen_resp_header && (bev == ctx->dst.bev)) {
+
+	    /* 
+	     * When in passthrough mode and an upstream proxy is set, discard
+	     * the upstream proxy's reply to CONNECT message before starting 
+	     * to actually pass through the traffic.
+	     */
+		if (ctx->passthrough) {
+			char* line;
+			log_dbg_printf("\nReply from upstream proxy:\n");
+			while ((line = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF))) {
+				log_dbg_printf("\t%s\n", line);
 			}
-			replace = pxy_http_resphdr_filter_line(line, ctx);
-			if (replace == line) {
-				evbuffer_add_printf(outbuf, "%s\r\n", line);
-			} else if (replace) {
-				evbuffer_add_printf(outbuf, "%s\r\n", replace);
-				free(replace);
-			}
-			free(line);
-			if (ctx->seen_resp_header) {
-				/* response header complete: log connection */
-				if (WANT_CONNECT_LOG(ctx)) {
-					pxy_log_connect_http(ctx);
-				}
-				break;
-			}
-		}
-		if (lb && WANT_CONTENT_LOG(ctx)) {
-			if (log_content_submit(ctx->logctx, lb,
-			                       0/*resp*/) == -1) {
-				logbuf_free(lb);
-				log_err_printf("Warning: Content log "
-				               "submission failed\n");
-			}
-		}
-		if (!ctx->seen_resp_header)
+			log_dbg_printf("\n");
+			// move the held back data
+			evbuffer_add_buffer(bufferevent_get_output(ctx->dst.bev), 
+				bufferevent_get_input(ctx->src.bev));
+			ctx->seen_resp_header = 1;
 			return;
+			
+		} else {
+			logbuf_t *lb = NULL, *tail = NULL;
+			char *line;
+			while ((line = evbuffer_readln(inbuf, NULL,
+										   EVBUFFER_EOL_CRLF))) {
+				char *replace;
+				if (WANT_CONTENT_LOG(ctx)) {
+					logbuf_t *tmp;
+					tmp = logbuf_new_printf(NULL, NULL,
+											"%s\r\n", line);
+					if (tail) {
+						if (tmp) {
+							tail->next = tmp;
+							tail = tail->next;
+						}
+					} else {
+						lb = tail = tmp;
+					}
+				}
+				replace = pxy_http_resphdr_filter_line(line, ctx);
+				if (replace == line) {
+					evbuffer_add_printf(outbuf, "%s\r\n", line);
+				} else if (replace) {
+					evbuffer_add_printf(outbuf, "%s\r\n", replace);
+					free(replace);
+				}
+				free(line);
+				if (ctx->seen_resp_header) {
+					/* response header complete: log connection */
+					if (WANT_CONNECT_LOG(ctx)) {
+						pxy_log_connect_http(ctx);
+					}
+					break;
+				}
+			}
+			if (lb && WANT_CONTENT_LOG(ctx)) {
+				if (log_content_submit(ctx->logctx, lb,
+									   0/*resp*/) == -1) {
+					logbuf_free(lb);
+					log_err_printf("Warning: Content log "
+								   "submission failed\n");
+				}
+			}
+			if (!ctx->seen_resp_header)
+				return;
+		}
 	}
 
 	/* out of memory condition? */
@@ -1568,8 +1686,9 @@ pxy_bev_readcb(struct bufferevent *bev, void *arg)
 	}
 
 	/* no data left after parsing headers? */
-	if (evbuffer_get_length(inbuf) == 0)
+	if (evbuffer_get_length(inbuf) == 0) {
 		return;
+	}
 
 	if (WANT_CONTENT_LOG(ctx)) {
 		logbuf_t *lb;
@@ -2000,6 +2119,8 @@ pxy_sni_resolve_cb(int errcode, struct evutil_addrinfo *ai, void *arg)
 {
 	pxy_conn_ctx_t *ctx = arg;
 
+	log_dbg_printf("pxy_sni_resolve_cb: '%s'\n", ctx->sni);
+
 	if (errcode) {
 		log_err_printf("Cannot resolve SNI hostname '%s': %s\n",
 		               ctx->sni, evutil_gai_strerror(errcode));
@@ -2106,7 +2227,18 @@ pxy_fd_readcb(MAYBE_UNUSED evutil_socket_t fd, UNUSED short what, void *arg)
 	}
 #endif /* !OPENSSL_NO_TLSEXT */
 
-	pxy_conn_connect(ctx);
+	if (ctx->spec->ssl && ctx->spec->connect_addrlen > 0) {
+		/*
+		 * With SSL and static forward, i.e. upstream proxy, we don't 
+		 * need to attempt an SSL connection, as it will fail. We don't
+		 * need it anyway, since we want to do unconditional forwarding
+		 * in the first place.
+		 */
+		ctx->passthrough = 1;
+		log_dbg_printf("Full SSL passthrough\n");
+	}
+	
+	pxy_conn_connect(ctx);	
 }
 
 /*
@@ -2139,7 +2271,10 @@ pxy_conn_setup(evutil_socket_t fd,
 	ctx->af = peeraddr->sa_family;
 
 	/* determine original destination of connection */
-	if (spec->natlookup) {
+	if (spec->natlookup || spec->connect_addrlen > 0) {
+		
+		// NAT lookup first; we need it for upstream proxy as well
+
 		/* NAT engine lookup */
 		ctx->addrlen = sizeof(struct sockaddr_storage);
 		if (spec->natlookup((struct sockaddr *)&ctx->addr, &ctx->addrlen,
@@ -2149,12 +2284,29 @@ pxy_conn_setup(evutil_socket_t fd,
 			evutil_closesocket(fd);
 			pxy_conn_ctx_free(ctx);
 			return;
+		} else {
+			log_dbg_printf("NAT lookup result: %s\n", 
+				sys_sockaddr_str((struct sockaddr *)&ctx->addr, 
+				ctx->addrlen));
 		}
-	} else if (spec->connect_addrlen > 0) {
-		/* static forwarding */
-		ctx->addrlen = spec->connect_addrlen;
-		memcpy(&ctx->addr, &spec->connect_addr, ctx->addrlen);
+		
+		// now for upstream proxy, i.e. static forward
+		if (spec->connect_addrlen > 0) {
+			/* 
+			 * static forwarding - we need to remember where we 
+			 * actually want to go
+			 */
+			ctx->org_addrlen = ctx->addrlen;
+			memcpy(&ctx->org_addr, &ctx->addr, ctx->addrlen);
+			ctx->addrlen = spec->connect_addrlen;
+			memcpy(&ctx->addr, &spec->connect_addr, ctx->addrlen);
+			log_dbg_printf("Upstream proxy: %s\n", 
+				sys_sockaddr_str((struct sockaddr *)&ctx->addr, 
+				ctx->addrlen));
+		}
+		
 	} else {
+		log_dbg_printf("SNI mode\n");
 		/* SNI mode */
 		if (!ctx->spec->ssl) {
 			/* if this happens, the proxyspec parser is broken */

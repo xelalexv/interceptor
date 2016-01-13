@@ -262,13 +262,17 @@ proxy_gc_cb(UNUSED evutil_socket_t fd, UNUSED short what, void *arg)
 {
 	proxy_ctx_t *ctx = arg;
 
+#ifdef DEBUG_PROXY
 	if (OPTS_DEBUG(ctx->opts))
 		log_dbg_printf("Garbage collecting caches started.\n");
+#endif
 
 	cachemgr_gc();
 
+#ifdef DEBUG_PROXY
 	if (OPTS_DEBUG(ctx->opts))
 		log_dbg_printf("Garbage collecting caches done.\n");
+#endif
 }
 
 /*

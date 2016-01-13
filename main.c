@@ -40,6 +40,7 @@
 #include "sys.h"
 #include "log.h"
 #include "version.h"
+#include "base64.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -176,6 +177,7 @@ main_usage(void)
 "              https 127.0.0.1 9443 sni 443     # https/4; SNI DNS lookups\n"
 "              tcp 127.0.0.1 10025              # tcp/4; default NAT engine\n"
 "              ssl 2001:db8::2 9999 pf          # ssl/6; NAT engine 'pf'\n"
+"  -w          credentials for upstream proxy in format \"user:password\"\n"
 "Example:\n"
 "  %s -k ca.key -c ca.pem -P  https 127.0.0.1 8443  https ::1 8443\n"
 	"%s", BNAME,
@@ -275,7 +277,7 @@ main(int argc, char *argv[])
 	}
 
 	while ((ch = getopt(argc, argv, OPT_g OPT_G OPT_Z OPT_i
-	                    "k:c:C:K:t:OPs:r:R:e:Eu:m:j:p:l:L:S:F:dDVh")) != -1) {
+	                    "k:c:C:K:t:OPs:r:R:e:Eu:m:j:w:p:l:L:S:F:dDVh")) != -1) {
 		switch (ch) {
 			case 'c':
 				if (opts->cacrt)
@@ -531,6 +533,18 @@ main(int argc, char *argv[])
 				log_dbg_mode(LOG_DBG_MODE_ERRLOG);
 				opts->debug = 1;
 				break;
+			case 'w':
+				if (opts->proxyAuth)
+					free(opts->proxyAuth);
+				char *cred = strdup(optarg);
+				if (!cred)
+					oom_die(argv0);
+				size_t sz;
+				char *buf = base64_enc((unsigned char *) cred, strlen(cred), &sz);
+				asprintf(&opts->proxyAuth, "Proxy-Authorization: Basic %s", buf);
+				free(buf);
+				free(cred);
+				break;
 			case 'V':
 				main_version();
 				exit(EXIT_SUCCESS);
@@ -559,7 +573,7 @@ main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 	for (proxyspec_t *spec = opts->spec; spec; spec = spec->next) {
-		if (spec->connect_addrlen || spec->sni_port)
+		if (spec->sni_port)
 			continue;
 		if (!spec->natengine) {
 			fprintf(stderr, "%s: no supported NAT engines "
@@ -578,6 +592,12 @@ main(int argc, char *argv[])
 		spec->natsocket = nat_getsocketcb(spec->natengine);
 	}
 	if (opts_has_ssl_spec(opts)) {
+		log_dbg_printf("SSL init ... ");
+		if (ssl_init() == -1) {
+			fprintf(stderr, "failed: %s\n", argv0);
+			exit(EXIT_FAILURE);
+		}
+		log_dbg_printf("succeeded\n");
 		if ((opts->cacrt || !opts->tgcrtdir) && !opts->cakey) {
 			fprintf(stderr, "%s: no CA key specified (-k).\n",
 			                argv0);
@@ -679,11 +699,10 @@ main(int argc, char *argv[])
 					exit(EXIT_FAILURE);
 				}
 			}
-			log_dbg_printf("- %s %s %s %s\n", lbuf,
+			log_dbg_printf("- %s %s %s %s %s\n", lbuf,
 			               (spec->ssl ? "ssl" : "tcp"),
 			               (spec->http ? "http" : "plain"),
-			               (spec->natengine ? spec->natengine
-			                                : cbuf));
+			               spec->natengine, cbuf);
 			if (lbuf)
 				free(lbuf);
 			if (cbuf)

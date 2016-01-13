@@ -85,7 +85,7 @@ START_TEST(proxyspec_parse_01)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in),
 	            "not IPv4 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!spec->next, "next is set");
@@ -108,7 +108,7 @@ START_TEST(proxyspec_parse_02)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in6),
 	            "not IPv6 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!spec->next, "next is set");
@@ -157,7 +157,7 @@ START_TEST(proxyspec_parse_05)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in),
 	            "not IPv4 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!spec->next, "next is set");
@@ -180,7 +180,7 @@ START_TEST(proxyspec_parse_06)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in),
 	            "not IPv4 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!spec->next, "next is set");
@@ -203,7 +203,7 @@ START_TEST(proxyspec_parse_07)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in),
 	            "not IPv4 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!spec->next, "next is set");
@@ -310,7 +310,7 @@ START_TEST(proxyspec_parse_13)
 	fail_unless(spec->connect_addrlen == sizeof(struct sockaddr_in6),
 	            "not IPv6 connect addr");
 	fail_unless(!spec->sni_port, "SNI port is set");
-	fail_unless(!spec->natengine, "natengine is set");
+	fail_unless(spec->natengine, "natengine is not set");
 	fail_unless(!spec->natlookup, "natlookup() is set");
 	fail_unless(!spec->natsocket, "natsocket() is set");
 	fail_unless(!!spec->next, "next is not set");
@@ -321,7 +321,7 @@ START_TEST(proxyspec_parse_13)
 	fail_unless(spec->next->connect_addrlen == sizeof(struct sockaddr_in),
 	            "not IPv4 connect addr");
 	fail_unless(!spec->next->sni_port, "SNI port is set");
-	fail_unless(!spec->next->natengine, "natengine is set");
+	fail_unless(spec->next->natengine, "natengine is not set");
 	fail_unless(!spec->next->natlookup, "natlookup() is set");
 	fail_unless(!spec->next->natsocket, "natsocket() is set");
 	proxyspec_free(spec);

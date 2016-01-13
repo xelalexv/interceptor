@@ -52,6 +52,8 @@ opts_new(void)
 	opts->chain = sk_X509_new_null();
 	opts->sslmethod = SSLv23_method;
 
+	opts->proxyAuth = strdup("");
+	
 	return opts;
 }
 
@@ -104,6 +106,9 @@ opts_free(opts_t *opts)
 	}
 	if (opts->contentlog) {
 		free(opts->contentlog);
+	}
+	if (opts->proxyAuth) {
+		free(opts->proxyAuth);
 	}
 	memset(opts, 0, sizeof(opts_t));
 	free(opts);
@@ -368,9 +373,12 @@ proxyspec_parse(int *argc, char **argv[], const char *natengine)
 					}
 					state = 0;
 				} else {
-					/* explicit target address */
-					free(spec->natengine);
-					spec->natengine = NULL;
+					/* 
+					 * explicit target address - i.e. upstream proxy,
+					 * so we keep the natengine since we need it 
+					 */
+					// free(spec->natengine);
+					// spec->natengine = NULL;
 					addr = **argv;
 					state++;
 				}
